@@ -142,6 +142,7 @@ public class MakeVTables extends GhidraScript {
 
         private long typeInfo;
         private Symbol symbol;
+        public String namespace;
         public String name;
         public ArrayList<VTable> vtables;
         public long size;
@@ -153,7 +154,7 @@ public class MakeVTables extends GhidraScript {
                 try {
                     var vtable = new VTable(iter, this.typeInfo);
                     vtables.add(vtable);
-                    printf("Adding vtable at %s with size %d\n".formatted(iter, vtable.size));
+                    // printf("Adding vtable at %s with size %d\n".formatted(iter, vtable.size));
                     iter = iter.addWrap(vtable.size);
                 }
                 catch (Exception e) {
@@ -221,8 +222,14 @@ public class MakeVTables extends GhidraScript {
             return null;
         }
 
-        private String getNamespace(Function func) {
-            return func.getParentNamespace().getName(true);
+        private boolean sameClass(Function func) {
+            var name = func.getParentNamespace().getName(true);
+            if (this.namespace.equals("")) {
+                return name.equals(this.name);
+            }
+            else {
+                return name.equals("%s::%s".formatted(this.namespace, this.name));
+            }
         }
 
         // Returns null if not found
@@ -238,18 +245,22 @@ public class MakeVTables extends GhidraScript {
                 allRefs.retainAll(vtable.refs);
             }
             // Loop through all the references
+            var toLog = "Processing class %s::%s:\n".formatted(this.namespace, this.name);
             for (var ref : allRefs) {
                 if (monitor.isCancelled()) {
                     throw new CancelledException(
                         "Task cancelled while looping through find alloc calls");
                 }
                 // Don't process refs that don't exist in the same namespace
-                if (!this.getNamespace(ref).equals(this.name)) {
+                if (!this.sameClass(ref)) {
+                    toLog += "\tSkipping %s since not in same class\n".formatted(ref.getName(true));
                     continue;
                 }
 
                 // If the reference isn't the constructor then just look for alloc calls within it
                 if (!ref.getName().contains(this.name)) {
+                    toLog += "\tProcessing ctor %s (address %s)\n".formatted(ref.getName(true),
+                        ref.getSymbol().getAddress());
                     var call = this.findAllocCallFor(ref, monitor);
                     if (call != null) {
                         return call;
@@ -263,9 +274,13 @@ public class MakeVTables extends GhidraScript {
                                 "Task cancelled while looping through constructor xref alloc calls");
                         }
                         // Ignore xrefs that aren't in the same namespace
-                        if (!this.getNamespace(caller).equals(this.name)) {
+                        if (!this.sameClass(caller)) {
+                            toLog += "\tSkipping %s since not in same class\n"
+                                    .formatted(caller.getName(true));
                             continue;
                         }
+                        toLog += "\tProcessing xref %s (address %s)\n"
+                                .formatted(caller.getName(), caller.getSymbol().getAddress());
                         var call = this.findAllocCallFor(caller, monitor);
                         if (call != null) {
                             return call;
@@ -274,6 +289,7 @@ public class MakeVTables extends GhidraScript {
                 }
             }
 
+            // print(toLog);
             throw new IllegalArgumentException("No call to alloc function found in all refs");
         }
 
@@ -289,9 +305,6 @@ public class MakeVTables extends GhidraScript {
             // Get the corresponding function containing the call
             var func = getFunctionContaining(call);
 
-            printf(
-                "Got function calling operator new at %s\n"
-                        .formatted(func.getSymbol().getAddress()));
             // Propagate constant values so I can check what the call
             var analyzer = this.getConstantAnalyzer(program);
             // It irks me that this is spelled wrong
@@ -304,7 +317,10 @@ public class MakeVTables extends GhidraScript {
         }
 
         ClassSymbol(Symbol symbol) throws IllegalArgumentException, MemoryAccessException {
-            this.name = symbol.getParentNamespace().getName(true);
+            var namespace = symbol.getParentNamespace();
+            this.name = namespace.getName();
+            var parent = namespace.getParentNamespace();
+            this.namespace = parent.isGlobal() ? "" : parent.getName();
             this.symbol = symbol;
             /* printf("Processing class %s (symbol %s)\n".formatted(this.name,
                 this.symbol.getAddress()));
@@ -313,6 +329,7 @@ public class MakeVTables extends GhidraScript {
             this.vtables = this.getVTables();
             try {
                 this.size = this.getSize();
+                printf("Class %s has size 0x%x\n".formatted(this.name, this.size));
             }
             catch (Exception e) {
                 printf("Couldn't get size for class %s: %s\n".formatted(this.name, e));
