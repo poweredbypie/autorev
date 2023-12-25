@@ -139,6 +139,7 @@ public class MakeVTables extends GhidraScript {
 
     class ClassSymbol {
         private final static String INVALID_SYMBOL = "The virtual table symbol passed was invalid";
+        private final static String ALLOC_FUNC = "operator.new";
 
         private long typeInfo;
         private Symbol symbol;
@@ -154,12 +155,10 @@ public class MakeVTables extends GhidraScript {
                 try {
                     var vtable = new VTable(iter, this.typeInfo);
                     vtables.add(vtable);
-                    // printf("Adding vtable at %s with size %d\n".formatted(iter, vtable.size));
                     iter = iter.addWrap(vtable.size);
                 }
                 catch (Exception e) {
                     // This is fine we just exit when an exception happens
-                    // printf("Got exception: %s\n", e);
                     break;
                 }
             }
@@ -213,7 +212,7 @@ public class MakeVTables extends GhidraScript {
                     }
 
                     // We found a call to operator new
-                    if (called.getName().contains("operator.new")) {
+                    if (called.getName().contains(ALLOC_FUNC)) {
                         return ref.getFromAddress();
                     }
                 }
@@ -222,14 +221,17 @@ public class MakeVTables extends GhidraScript {
             return null;
         }
 
-        private boolean sameClass(Function func) {
-            var name = func.getParentNamespace().getName(true);
+        private String fullName() {
             if (this.namespace.equals("")) {
-                return name.equals(this.name);
+                return name;
             }
             else {
-                return name.equals("%s::%s".formatted(this.namespace, this.name));
+                return "%s::%s".formatted(this.namespace, this.name);
             }
+        }
+
+        private boolean sameClass(Function func) {
+            return this.fullName().equals(func.getParentNamespace().getName(true));
         }
 
         // Returns null if not found
@@ -245,7 +247,6 @@ public class MakeVTables extends GhidraScript {
                 allRefs.retainAll(vtable.refs);
             }
             // Loop through all the references
-            var toLog = "Processing class %s::%s:\n".formatted(this.namespace, this.name);
             for (var ref : allRefs) {
                 if (monitor.isCancelled()) {
                     throw new CancelledException(
@@ -253,14 +254,11 @@ public class MakeVTables extends GhidraScript {
                 }
                 // Don't process refs that don't exist in the same namespace
                 if (!this.sameClass(ref)) {
-                    toLog += "\tSkipping %s since not in same class\n".formatted(ref.getName(true));
                     continue;
                 }
 
                 // If the reference isn't the constructor then just look for alloc calls within it
-                if (!ref.getName().contains(this.name)) {
-                    toLog += "\tProcessing ctor %s (address %s)\n".formatted(ref.getName(true),
-                        ref.getSymbol().getAddress());
+                if (!ref.getName().equals(this.name)) {
                     var call = this.findAllocCallFor(ref, monitor);
                     if (call != null) {
                         return call;
@@ -275,12 +273,8 @@ public class MakeVTables extends GhidraScript {
                         }
                         // Ignore xrefs that aren't in the same namespace
                         if (!this.sameClass(caller)) {
-                            toLog += "\tSkipping %s since not in same class\n"
-                                    .formatted(caller.getName(true));
                             continue;
                         }
-                        toLog += "\tProcessing xref %s (address %s)\n"
-                                .formatted(caller.getName(), caller.getSymbol().getAddress());
                         var call = this.findAllocCallFor(caller, monitor);
                         if (call != null) {
                             return call;
@@ -289,7 +283,6 @@ public class MakeVTables extends GhidraScript {
                 }
             }
 
-            // print(toLog);
             throw new IllegalArgumentException("No call to alloc function found in all refs");
         }
 
@@ -320,24 +313,22 @@ public class MakeVTables extends GhidraScript {
             var namespace = symbol.getParentNamespace();
             this.name = namespace.getName();
             var parent = namespace.getParentNamespace();
-            this.namespace = parent.isGlobal() ? "" : parent.getName();
+            this.namespace = parent.isGlobal() ? "" : parent.getName(true);
             this.symbol = symbol;
-            /* printf("Processing class %s (symbol %s)\n".formatted(this.name,
-                this.symbol.getAddress()));
-                */
             this.typeInfo = this.getTypeInfo();
             this.vtables = this.getVTables();
             try {
                 this.size = this.getSize();
-                printf("Class %s has size 0x%x\n".formatted(this.name, this.size));
             }
-            catch (Exception e) {
-                printf("Couldn't get size for class %s: %s\n".formatted(this.name, e));
+            catch (IllegalArgumentException | CancelledException e) {
+                printf("Couldn't get size for class %s: %s\n", this.name,
+                    e.getClass().getCanonicalName());
             }
         }
 
         public void dump(FileOutputStream stream) throws IOException {
-            stream.write("class %s (size %s):\n".formatted(this.name, this.size).getBytes());
+            var size = this.size > 0 ? Long.toString(this.size) : "unknown";
+            stream.write("class %s (size %s):\n".formatted(this.fullName(), size).getBytes());
             for (var vtable : this.vtables) {
                 vtable.dump(stream);
             }
