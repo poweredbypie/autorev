@@ -2,14 +2,25 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.concurrent.TimeUnit;
 
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.app.plugin.core.analysis.ConstantPropagationAnalyzer;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Endian;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.util.SymbolicPropogator;
+import ghidra.util.classfinder.ClassSearcher;
 import ghidra.util.exception.CancelledException;
+import ghidra.util.task.TaskMonitor;
+import ghidra.util.task.TaskMonitorAdapter;
+import ghidra.util.task.TimeoutTaskMonitor;
 
 public class MakeVTables extends GhidraScript {
     private final static String VTABLE_SYMBOL = "vtable";
@@ -18,7 +29,7 @@ public class MakeVTables extends GhidraScript {
     class VTable {
         private Address address;
         public ArrayList<Function> entries;
-        public ArrayList<Function> refs;
+        public HashSet<Function> refs;
         public int size;
         public int offset;
 
@@ -65,12 +76,12 @@ public class MakeVTables extends GhidraScript {
             return entries;
         }
 
-        private ArrayList<Function> getRefs() {
+        private HashSet<Function> getRefs() {
             // Get references to the start of the actual vtable
             var refs = getReferencesTo(this.address.addWrap(2 * POINTER_SIZE));
 
             // Filter out references that are destructors
-            var funcs = new ArrayList<Function>();
+            var funcs = new HashSet<Function>();
             for (var ref : refs) {
                 // Get the address that references the vtable start
                 var from = ref.getFromAddress();
@@ -133,6 +144,7 @@ public class MakeVTables extends GhidraScript {
         private Symbol symbol;
         public String name;
         public ArrayList<VTable> vtables;
+        public long size;
 
         private ArrayList<VTable> getVTables() {
             var vtables = new ArrayList<VTable>();
@@ -164,6 +176,133 @@ public class MakeVTables extends GhidraScript {
             return offset;
         }
 
+        private ConstantPropagationAnalyzer getConstantAnalyzer(Program program) {
+            // Thanks to astrelsky 
+            // https://github.com/astrelsky/ghidra_scripts/blob/ac3caaf7762f59a72bfeef8e24cbc8d1eda00657/PrintfSigOverrider.java#L292-L317
+            var manager = AutoAnalysisManager.getAnalysisManager(program);
+            var analyzers = ClassSearcher.getInstances(ConstantPropagationAnalyzer.class);
+            for (ConstantPropagationAnalyzer analyzer : analyzers) {
+                if (analyzer.canAnalyze(program)) {
+                    return (ConstantPropagationAnalyzer) manager.getAnalyzer(analyzer.getName());
+                }
+            }
+            return null;
+        }
+
+        private Address findAllocCallFor(Function func, TaskMonitor monitor)
+                throws CancelledException {
+            // Kind of stolen from FunctionDB.getReferencesFromBody
+            var body = func.getBody();
+            var manager = func.getProgram().getReferenceManager();
+
+            for (var addr : body.getAddresses(true)) {
+                if (monitor.isCancelled()) {
+                    throw new CancelledException("Task cancelled while finding alloc calls");
+                }
+
+                var refs = manager.getReferencesFrom(addr);
+                if (refs == null) {
+                    continue;
+                }
+
+                for (var ref : refs) {
+                    var called = getFunctionAt(ref.getToAddress());
+                    if (called == null) {
+                        continue;
+                    }
+
+                    // We found a call to operator new
+                    if (called.getName().contains("operator.new")) {
+                        return ref.getFromAddress();
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private String getNamespace(Function func) {
+            return func.getParentNamespace().getName(true);
+        }
+
+        // Returns null if not found
+        private Address findAllocCall(TaskMonitor monitor)
+                throws IllegalArgumentException, CancelledException {
+            var allRefs = new HashSet<Function>();
+            // Union all functions in each vtable's references
+            for (var vtable : this.vtables) {
+                allRefs.addAll(vtable.refs);
+            }
+            // Intersect all functions in each vtable's references
+            for (var vtable : this.vtables) {
+                allRefs.retainAll(vtable.refs);
+            }
+            // Loop through all the references
+            for (var ref : allRefs) {
+                if (monitor.isCancelled()) {
+                    throw new CancelledException(
+                        "Task cancelled while looping through find alloc calls");
+                }
+                // Don't process refs that don't exist in the same namespace
+                if (!this.getNamespace(ref).equals(this.name)) {
+                    continue;
+                }
+
+                // If the reference isn't the constructor then just look for alloc calls within it
+                if (!ref.getName().contains(this.name)) {
+                    var call = this.findAllocCallFor(ref, monitor);
+                    if (call != null) {
+                        return call;
+                    }
+                }
+                else {
+                    var callers = ref.getCallingFunctions(monitor);
+                    for (var caller : callers) {
+                        if (monitor.isCancelled()) {
+                            throw new CancelledException(
+                                "Task cancelled while looping through constructor xref alloc calls");
+                        }
+                        // Ignore xrefs that aren't in the same namespace
+                        if (!this.getNamespace(caller).equals(this.name)) {
+                            continue;
+                        }
+                        var call = this.findAllocCallFor(caller, monitor);
+                        if (call != null) {
+                            return call;
+                        }
+                    }
+                }
+            }
+
+            throw new IllegalArgumentException("No call to alloc function found in all refs");
+        }
+
+        private long getSize() throws IllegalArgumentException, CancelledException {
+            var program = this.symbol.getProgram();
+
+            // Have a 5 second timeout
+            var monitor =
+                TimeoutTaskMonitor.timeoutIn(5, TimeUnit.SECONDS, new TaskMonitorAdapter(true));
+
+            // Call must be nonnull otherwise it'll throw an exception which we'll propagate
+            var call = this.findAllocCall(monitor);
+            // Get the corresponding function containing the call
+            var func = getFunctionContaining(call);
+
+            printf(
+                "Got function calling operator new at %s\n"
+                        .formatted(func.getSymbol().getAddress()));
+            // Propagate constant values so I can check what the call
+            var analyzer = this.getConstantAnalyzer(program);
+            // It irks me that this is spelled wrong
+            var prop = new SymbolicPropogator(program);
+            analyzer.flowConstants(program, func.getEntryPoint(), func.getBody(), prop, monitor);
+
+            // Get the value of the register at the point of the call
+            var reg = func.getProgram().getLanguage().getRegister("r0");
+            return prop.getRegisterValue(call, reg).getValue();
+        }
+
         ClassSymbol(Symbol symbol) throws IllegalArgumentException, MemoryAccessException {
             this.name = symbol.getParentNamespace().getName(true);
             this.symbol = symbol;
@@ -172,10 +311,16 @@ public class MakeVTables extends GhidraScript {
                 */
             this.typeInfo = this.getTypeInfo();
             this.vtables = this.getVTables();
+            try {
+                this.size = this.getSize();
+            }
+            catch (Exception e) {
+                printf("Couldn't get size for class %s: %s\n".formatted(this.name, e));
+            }
         }
 
         public void dump(FileOutputStream stream) throws IOException {
-            stream.write("VTables for class %s:\n".formatted(this.name).getBytes());
+            stream.write("class %s (size %s):\n".formatted(this.name, this.size).getBytes());
             for (var vtable : this.vtables) {
                 vtable.dump(stream);
             }
@@ -197,9 +342,28 @@ public class MakeVTables extends GhidraScript {
         return classes;
     }
 
+    private void assertAndroid() throws IllegalArgumentException {
+        var desc = this.currentProgram.getLanguage().getLanguageDescription();
+        if (desc.getEndian() != Endian.LITTLE) {
+            throw new IllegalArgumentException("Current program is not little endian");
+        }
+        if (!desc.getProcessor().toString().contains("ARM")) {
+            throw new IllegalArgumentException("Processor for current program is not ARM-based");
+        }
+        if (desc.getSize() != POINTER_SIZE * 8) {
+            throw new IllegalArgumentException("Current program processor is not 32-bits");
+        }
+        if (!this.currentProgram.getExecutableFormat().contains("ELF")) {
+            throw new IllegalArgumentException("Current program is not an ELF file");
+        }
+    }
+
     @Override
     protected void run()
             throws CancelledException, FileNotFoundException, SecurityException, IOException {
+        // Verify we're running on 32 bit Android
+        this.assertAndroid();
+
         var file = this.askFile("Choose output dump", "OK");
         var classes = this.getClasses();
         try (var stream = new FileOutputStream(file)) {
