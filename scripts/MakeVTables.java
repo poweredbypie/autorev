@@ -2,8 +2,15 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+import java.util.Optional;
 
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.plugin.core.analysis.ConstantPropagationAnalyzer;
@@ -11,10 +18,10 @@ import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.lang.Endian;
 import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Program;
-import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.util.SymbolicPropogator;
 import ghidra.util.classfinder.ClassSearcher;
 import ghidra.util.exception.CancelledException;
@@ -147,6 +154,7 @@ public class MakeVTables extends GhidraScript {
         public String name;
         public ArrayList<VTable> vtables;
         public long size;
+        public boolean guessed;
 
         private ArrayList<VTable> getVTables() {
             var vtables = new ArrayList<VTable>();
@@ -189,36 +197,19 @@ public class MakeVTables extends GhidraScript {
             return null;
         }
 
-        private Address findAllocCallFor(Function func, TaskMonitor monitor)
-                throws CancelledException {
+        private Optional<Address> findAllocCallForFunc(Function func, TaskMonitor monitor) {
             // Kind of stolen from FunctionDB.getReferencesFromBody
-            var body = func.getBody();
-            var manager = func.getProgram().getReferenceManager();
-
-            for (var addr : body.getAddresses(true)) {
-                if (monitor.isCancelled()) {
-                    throw new CancelledException("Task cancelled while finding alloc calls");
-                }
-
-                var refs = manager.getReferencesFrom(addr);
-                if (refs == null) {
-                    continue;
-                }
-
-                for (var ref : refs) {
-                    var called = getFunctionAt(ref.getToAddress());
-                    if (called == null) {
-                        continue;
-                    }
-
-                    // We found a call to operator new
-                    if (called.getName().contains(ALLOC_FUNC)) {
-                        return ref.getFromAddress();
-                    }
-                }
-            }
-
-            return null;
+            return StreamSupport.stream(func.getBody().getAddresses(true).spliterator(), false)
+                    .takeWhile(ignore -> !monitor.isCancelled())
+                    .flatMap(
+                        addr -> Stream.of(
+                            func.getProgram().getReferenceManager().getReferencesFrom(addr)))
+                    .filter(ref -> {
+                        var called = getFunctionAt(ref.getToAddress());
+                        return called != null && called.getName().contains(ALLOC_FUNC);
+                    })
+                    .map(ref -> ref.getFromAddress())
+                    .findFirst();
         }
 
         private String fullName() {
@@ -235,66 +226,42 @@ public class MakeVTables extends GhidraScript {
         }
 
         // Returns null if not found
-        private Address findAllocCall(TaskMonitor monitor)
-                throws IllegalArgumentException, CancelledException {
-            var allRefs = new HashSet<Function>();
-            // Union all functions in each vtable's references
-            for (var vtable : this.vtables) {
-                allRefs.addAll(vtable.refs);
-            }
+        private Optional<Address> findAllocCall(TaskMonitor monitor) {
+            HashSet<Function> allRefs = null;
             // Intersect all functions in each vtable's references
             for (var vtable : this.vtables) {
-                allRefs.retainAll(vtable.refs);
-            }
-            // Loop through all the references
-            for (var ref : allRefs) {
-                if (monitor.isCancelled()) {
-                    throw new CancelledException(
-                        "Task cancelled while looping through find alloc calls");
-                }
-                // Don't process refs that don't exist in the same namespace
-                if (!this.sameClass(ref)) {
-                    continue;
-                }
-
-                // If the reference isn't the constructor then just look for alloc calls within it
-                if (!ref.getName().equals(this.name)) {
-                    var call = this.findAllocCallFor(ref, monitor);
-                    if (call != null) {
-                        return call;
-                    }
+                if (allRefs == null) {
+                    allRefs = vtable.refs;
                 }
                 else {
-                    var callers = ref.getCallingFunctions(monitor);
-                    for (var caller : callers) {
-                        if (monitor.isCancelled()) {
-                            throw new CancelledException(
-                                "Task cancelled while looping through constructor xref alloc calls");
-                        }
-                        // Ignore xrefs that aren't in the same namespace
-                        if (!this.sameClass(caller)) {
-                            continue;
-                        }
-                        var call = this.findAllocCallFor(caller, monitor);
-                        if (call != null) {
-                            return call;
-                        }
-                    }
+                    allRefs.retainAll(vtable.refs);
                 }
             }
 
-            throw new IllegalArgumentException("No call to alloc function found in all refs");
+            return allRefs.stream()
+                    .takeWhile(ignore -> !monitor.isCancelled())
+                    .filter(ref -> this.sameClass(ref))
+                    .flatMap(ref -> {
+                        if (!ref.getName().equals(this.name)) {
+                            // If it's not the ctor just check ourselves
+                            return Stream.of(ref);
+                        }
+                        else {
+                            // Otherwise check the references of the ctor
+                            return ref.getCallingFunctions(monitor)
+                                    .stream()
+                                    .filter(caller -> this.sameClass(caller));
+                        }
+                    })
+                    .map(func -> this.findAllocCallForFunc(func, monitor))
+                    .filter(call -> call.isPresent())
+                    .findFirst()
+                    .orElse(Optional.empty());
         }
 
-        private long getSize() throws IllegalArgumentException, CancelledException {
+        private Optional<Long> getAllocSizeFromCall(Address call, TaskMonitor monitor) {
             var program = this.symbol.getProgram();
 
-            // Have a 5 second timeout
-            var monitor =
-                TimeoutTaskMonitor.timeoutIn(5, TimeUnit.SECONDS, new TaskMonitorAdapter(true));
-
-            // Call must be nonnull otherwise it'll throw an exception which we'll propagate
-            var call = this.findAllocCall(monitor);
             // Get the corresponding function containing the call
             var func = getFunctionContaining(call);
 
@@ -302,11 +269,32 @@ public class MakeVTables extends GhidraScript {
             var analyzer = this.getConstantAnalyzer(program);
             // It irks me that this is spelled wrong
             var prop = new SymbolicPropogator(program);
-            analyzer.flowConstants(program, func.getEntryPoint(), func.getBody(), prop, monitor);
+            try {
+                analyzer.flowConstants(program, func.getEntryPoint(), func.getBody(), prop,
+                    monitor);
 
-            // Get the value of the register at the point of the call
-            var reg = func.getProgram().getLanguage().getRegister("r0");
-            return prop.getRegisterValue(call, reg).getValue();
+                // Get the value of the register at the point of the call
+                var reg = func.getProgram().getLanguage().getRegister("r0");
+                return Optional.of(prop.getRegisterValue(call, reg).getValue());
+            }
+            catch (CancelledException c) {
+                return Optional.empty();
+            }
+        }
+
+        private Optional<Long> getAllocSize() {
+            // Have a 5 second timeout
+            var monitor =
+                TimeoutTaskMonitor.timeoutIn(5, TimeUnit.SECONDS, new TaskMonitorAdapter(true));
+
+            // Call must be nonnull otherwise it'll throw an exception which we'll propagate
+            return this.findAllocCall(monitor)
+                    .flatMap(call -> this.getAllocSizeFromCall(call, monitor));
+        }
+
+        private long getGuessedSize() {
+            // Unimplemented
+            return 0;
         }
 
         ClassSymbol(Symbol symbol) throws IllegalArgumentException, MemoryAccessException {
@@ -317,13 +305,18 @@ public class MakeVTables extends GhidraScript {
             this.symbol = symbol;
             this.typeInfo = this.getTypeInfo();
             this.vtables = this.getVTables();
-            try {
-                this.size = this.getSize();
-            }
-            catch (IllegalArgumentException | CancelledException e) {
-                printf("Couldn't get size for class %s: %s\n", this.name,
-                    e.getClass().getCanonicalName());
-            }
+            this.getAllocSize()
+                    .ifPresentOrElse(
+                        size -> {
+                            this.size = size;
+                            this.guessed = false;
+                            // printf("Size for class %s is %s\n", this.fullName(), this.size);
+                        },
+                        () -> {
+                            printf("Couldn't get size of class %s\n", this.fullName());
+                            this.size = this.getGuessedSize();
+                            this.guessed = true;
+                        });
         }
 
         public void dump(FileOutputStream stream) throws IOException {
@@ -335,19 +328,19 @@ public class MakeVTables extends GhidraScript {
         }
     }
 
-    private ArrayList<ClassSymbol> getClasses() {
-        var table = this.currentProgram.getSymbolTable();
-        SymbolIterator symbols = table.getSymbols(VTABLE_SYMBOL);
-        var classes = new ArrayList<ClassSymbol>();
-        for (var symbol : symbols) {
-            try {
-                classes.add(new ClassSymbol(symbol));
-            }
-            catch (Exception e) {
-                this.printf("Couldn't convert symbol to virtual table: %s\n", e);
-            }
-        }
-        return classes;
+    private List<ClassSymbol> getClasses() {
+        // I don't know if this is slow or not but it seems to work fine
+        return StreamSupport.stream(
+            this.currentProgram.getSymbolTable().getSymbols(VTABLE_SYMBOL).spliterator(), false)
+                .flatMap(symbol -> {
+                    try {
+                        return Stream.of(new ClassSymbol(symbol));
+                    }
+                    catch (Exception e) {
+                        return Stream.empty();
+                    }
+                })
+                .collect(Collectors.toList());
     }
 
     private void assertAndroid() throws IllegalArgumentException {
