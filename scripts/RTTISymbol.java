@@ -1,13 +1,9 @@
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.IntStream;
-import java.util.stream.Stream;
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.data.DataType;
-import ghidra.program.model.data.Structure;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.Symbol;
 
@@ -36,17 +32,35 @@ public class RTTISymbol {
         }
     };
 
+    private class Parent {
+        public String name;
+        public int offset;
+        public boolean pub;
+
+        Parent(String name, int offset, boolean pub) {
+            this.name = name;
+            this.offset = offset;
+            this.pub = pub;
+        }
+
+        public String toString() {
+            String specifier = this.pub ? "public" : "";
+            return "%s %s (%x)".formatted(specifier, this.name, this.offset);
+        }
+    }
+
     private GhidraScript script;
     private int pointerSize;
+    private List<Parent> parents;
     public DataType dataType;
-    public List<String> parents;
     public Address address;
 
     // Gets the typeinfo structure's vtable
     private Symbol getVtable() throws IllegalArgumentException, MemoryAccessException {
         var space = this.address.getAddressSpace();
         // We have to subtract 2 slots for the struct offset and the typeinfo pointer
-        var address = space.getAddress(this.script.getInt(this.address) - (2 * this.pointerSize));
+        var address =
+            space.getAddress(this.script.getInt(this.address) - (2 * this.pointerSize));
         var vtable =
             this.script.getSymbolAt(address);
         if (vtable == null) {
@@ -61,15 +75,16 @@ public class RTTISymbol {
         var className = vtable.getParentNamespace().getName();
         var types = this.script.getDataTypes(className);
         if (types.length != 1) {
-            throw new IllegalArgumentException("Too many or too little datatypes for class %s (%d)"
-                    .formatted(className, types.length));
+            throw new IllegalArgumentException(
+                "Too many or too little datatypes for class %s (%d)"
+                        .formatted(className, types.length));
         }
 
         return types[0];
     }
 
     // Don't multiply by pointerSize before passing something to this because it already does that
-    private String derefRTTI(Address address, int offset)
+    private Parent derefRTTI(Address address, int offset)
             throws IllegalArgumentException, MemoryAccessException {
         var rtti = address.getAddressSpace()
                 .getAddress(
@@ -80,10 +95,13 @@ public class RTTISymbol {
                 "Couldn't dereference typeinfo at address %s, offset %x".formatted(address,
                     offset));
         }
-        return symbol.getParentNamespace().getName(true);
+        return new Parent(
+            symbol.getParentNamespace().getName(true),
+            0,
+            false);
     }
 
-    private List<String> getSingleInherited()
+    private List<Parent> getSingleInherited()
             throws IllegalArgumentException, MemoryAccessException {
         /*
          * class __si_class_type_info {
@@ -97,7 +115,7 @@ public class RTTISymbol {
         return List.of(this.derefRTTI(this.address, 2));
     }
 
-    private List<String> getMultipleInherited()
+    private List<Parent> getMultipleInherited()
             throws IllegalArgumentException, MemoryAccessException {
         /*
          * class __vmi_class_type_info {
@@ -119,20 +137,29 @@ public class RTTISymbol {
 
         // Assert that there are no repeat inheritance since this allows me to make some assumptions
         var flags = this.script.getInt(this.address.add(2 * this.pointerSize));
-        if (flags != 0) {
+        if ((flags & 2) != 0) {
             throw new IllegalArgumentException(
-                "Assumption violated: flags for class is %x".formatted(flags));
+                "Assumption violated: no support for diamond repeats (lazy)");
         }
 
         var baseCount = this.script.getInt(this.address.add(3 * this.pointerSize));
-        var parents = new ArrayList<String>();
+        var parents = new ArrayList<Parent>();
         for (int i = 0; i < baseCount; i += 1) {
-            parents.add(this.derefRTTI(this.address, 4 + (i * 2)));
+            var parent = this.derefRTTI(this.address, 4 + (i * 2));
+            var baseFlags = this.script.getInt(this.address.add((5 + (i * 2)) * this.pointerSize));
+            if ((baseFlags & 1) != 0) {
+                throw new IllegalArgumentException(
+                    "Assumption violated: no support for virtual inheritance (lazy)");
+            }
+            // Whether the parent is publicly inherited
+            parent.pub = (baseFlags & 2) != 0;
+            parent.offset = (baseFlags >> 8);
+            parents.add(parent);
         }
         return parents;
     }
 
-    private List<String> getParents() throws IllegalArgumentException, MemoryAccessException {
+    private List<Parent> getParents() throws IllegalArgumentException, MemoryAccessException {
         switch (InheritType.fromString(this.dataType.getName())) {
             case NONE:
                 // Nothing, base class
@@ -165,6 +192,7 @@ public class RTTISymbol {
             return "(base)";
         }
 
-        return ": " + String.join(", ", this.parents);
+        var strings = this.parents.stream().map(parent -> parent.toString()).toList();
+        return ": " + String.join(", ", strings);
     }
 }
