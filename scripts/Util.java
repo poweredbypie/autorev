@@ -4,6 +4,14 @@ import ghidra.program.model.listing.Program;
 import ghidra.util.classfinder.ClassSearcher;
 
 public class Util {
+    public static int pointerSize(Program program) {
+        return program.getLanguage().getDefaultSpace().getPointerSize();
+    }
+
+    public static boolean isELF(Program program) {
+        return program.getExecutableFormat().contains("ELF");
+    }
+
     public static ConstantPropagationAnalyzer getConstantAnalyzer(Program program) {
         // Thanks to astrelsky 
         // https://github.com/astrelsky/ghidra_scripts/blob/ac3caaf7762f59a72bfeef8e24cbc8d1eda00657/PrintfSigOverrider.java#L292-L317

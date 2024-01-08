@@ -38,5 +38,23 @@ public class MakeVTables extends GhidraScript {
                 c.dump(stream);
             }
         }
+
+        /*
+         * TODO: rename Windows vtable functions
+         * Pseudocode:
+         * vtables = getSymbols('vftable')
+         * for vtable in vtables:
+         *      data = getDataAt(vtable.getAddress())
+         *      assert(data.getDataType() typeof Structure)
+         *      for i in range(0, data.getNumComponents()):
+         *          # This is already dereferenced and everything
+         *          addr = data.getComponent(i).getValue()
+         *          assert(addr typeof Address)
+         *          func = getFunctionContaining(addr)
+         *          if func.isExternal():
+         *              continue # This is probably a cocos or msvcprt function so we skip renaming
+         *          
+         *          func.setName(getAndroidNameFor(func))
+         */
     }
 }
