@@ -1,0 +1,54 @@
+// LSP support for Ghidra scripts
+// To generate classpath for LSP, run the following:
+// gradle eclipse -PGHIDRA_PATH=<ghidra_path>
+
+plugins {
+    // Need to specify Java plugin for Eclipse plugin to generate classpath
+    id 'java'
+    id 'eclipse'
+}
+
+def ghidraDir = project.property 'GHIDRA_PATH'
+
+// Import extension support script
+apply from: ghidraDir + '/support/buildExtension.gradle'
+
+repositories { mavenCentral() }
+
+eclipse.classpath {
+    downloadJavadoc = true
+    downloadSources = true
+    
+    file.whenMerged { classpath ->
+        def docs = classpath.fileReference ghidraDir + '/docs/GhidraAPI_javadoc.zip'
+        for (entry in classpath.entries) {
+            if (entry.kind != 'lib') {
+                continue
+            }
+
+            def src = file(entry.library.file.absolutePath.replaceAll('.jar', '-src.zip'))
+            if (!src.exists()) {
+                continue
+            }
+
+            entry.sourcePath = classpath.fileReference src
+            entry.javadocPath = docs
+        }
+    }
+}
+
+sourceSets {
+    scripts {
+        java {
+            srcDir "ghidra_scripts"
+        }
+    }
+}
+
+/*
+buildExtension {
+    exclude ".vscode"
+    exclude "gradle*"
+    exclude ".editorconfig"
+}
+*/
